@@ -1,0 +1,47 @@
+# Common
+einops==0.7.0                   # Tensor operations
+
+# Training
+torch==2.4.0
+omegaconf==2.3.0                # Configuration system.
+lpips==0.1.4                    # LPIPS model for VAE training
+
+# Dataloading
+bson==0.5.10                    # bson for Image dataloading
+tensorflow==2.16.1              # Video dataloading
+opencv-python==4.9.0.80         # OpenCV
+sentencepiece==0.2.0            # For Text Encoder
+
+# Modeling
+diffusers==0.29.1               # Diffusers
+rotary-embedding-torch==0.8.9   # Rotary positional embedding
+transformers==4.38.2            # Transformers
+torchvision==0.19.0
+tiktoken==0.7.0                 # Tiktoken for generation
+transformers_stream_generator==0.0.5 #LLM generation support
+
+# Metrics
+torchmetrics==1.3.2             # Core module for metric
+pycocotools==2.0.7              # COCO-related
+torch-fidelity==0.3.0           # FID-related
+
+# Experiment Tracking
+moviepy==1.0.3                  # WandB Logging Image & Video
+imageio==2.34.0                 # WandB Logging Image & Video
+tabulate==0.9.0                 # Logging Table
+deepdiff==7.0.1                 # Find difference of config
+
+# Testing
+parameterized==0.9.0            # Define multiple tests through decorators.
+
+# Notebook
+mediapy==1.2.0                  # Notebook Visualization
+
+# DevOPs
+black >= 24, < 25               # Code formatting
+flake8 >= 7, < 8                # Code style
+isort >= 5, < 6                 # Import sorting
+pre-commit==3.7.0               # Pre-commit hooks
+expecttest==0.2.1               # Pytorch dist tests
+hypothesis==6.100.1             # Fix randomness
+av==12.0.0                      # Process audio and video
