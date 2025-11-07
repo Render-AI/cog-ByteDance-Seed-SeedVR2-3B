@@ -5,10 +5,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Tuple, Union
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import mediapy
 import torch
@@ -30,43 +34,57 @@ from data.image.transforms.na_resize import NaResize
 from data.video.transforms.rearrange import Rearrange
 from projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
-MODEL_CACHE = "model_cache"
+MODEL_CACHE = Path("model_cache")
 BASE_URL = "https://weights.replicate.delivery/default/seedvr2/model_cache/"
-os.environ.setdefault("HF_HOME", MODEL_CACHE)
-os.environ.setdefault("TORCH_HOME", MODEL_CACHE)
-os.environ.setdefault("HF_DATASETS_CACHE", MODEL_CACHE)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", MODEL_CACHE)
-Path(MODEL_CACHE).mkdir(parents=True, exist_ok=True)
+CKPT_DIR = MODEL_CACHE / "weights"
+WHEEL_DIR = MODEL_CACHE / "wheels"
 
-CKPT_DIR = Path(MODEL_CACHE) / "weights"
-WHEEL_DIR = Path(MODEL_CACHE) / "wheels"
+os.environ.setdefault("HF_HOME", str(MODEL_CACHE))
+os.environ.setdefault("TORCH_HOME", str(MODEL_CACHE))
+os.environ.setdefault("HF_DATASETS_CACHE", str(MODEL_CACHE))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(MODEL_CACHE))
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-WEIGHT_FILES = {
-    "dit": "seedvr2_ema_3b.pth",
+MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+
+SHARED_WEIGHT_FILES = {
     "vae": "ema_vae.pth",
     "pos_emb": "pos_emb.pt",
     "neg_emb": "neg_emb.pt",
 }
+
+# Runner metadata
+
+@dataclass(frozen=True)
+class ModelSpec:
+    weight: str
+    config: str
+
+
+MODEL_VARIANTS: Dict[str, ModelSpec] = {
+    "3b": ModelSpec(weight="seedvr2_ema_3b.pth", config="configs_3b/main.yaml"),
+    "7b": ModelSpec(weight="seedvr2_ema_7b.pth", config="configs_7b/main.yaml"),
+}
+DEFAULT_MODEL_VARIANT = "3b"
 
 APEX_WHEEL = "apex-0.1-cp310-cp310-linux_x86_64.whl"
 FLASH_ATTN_SPEC = "flash_attn"
 MODEL_FILES = [
     ".cache.tar",
     "version.txt",
+    "version_diffusers_cache.txt",
     "weights.tar",
     "wheels.tar",
     "xet.tar",
 ]
 
 
-def download_weights(url: str, dest: str) -> None:
+def download_weights(url: str, dest: Path) -> None:
     start = time.time()
     print("[!] Initiating download from URL:", url)
     print("[~] Destination path:", dest)
-    target = dest
-    if dest.endswith(".tar"):
-        target = os.path.dirname(dest)
-    command = ["pget", "-vf" + ("x" if dest.endswith(".tar") else ""), url, target]
+    target = dest if dest.suffix != ".tar" else dest.parent
+    command = ["pget", "-vf" + ("x" if dest.suffix == ".tar" else ""), url, str(target)]
     try:
         print(f"[~] Running command: {' '.join(command)}")
         subprocess.check_call(command, close_fds=False)
@@ -149,6 +167,68 @@ def mux_audio_stream(src_media: Path, video_only: Path, output_path: Path) -> Pa
     return output_path
 
 
+def ensure_model_cache() -> None:
+    MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+    for model_file in MODEL_FILES:
+        url = BASE_URL + model_file
+        dest_path = MODEL_CACHE / model_file
+        if model_file.endswith(".tar"):
+            extracted_path = dest_path.parent / model_file.replace(".tar", "")
+            if extracted_path.exists():
+                continue
+        elif dest_path.exists():
+            continue
+        download_weights(url, dest_path)
+
+
+class LazyRunnerManager:
+    def __init__(self, device: torch.device, builder) -> None:
+        self._device = device
+        self._builder = builder
+        self._bundles: Dict[str, Dict] = {}
+        self._active: Optional[str] = None
+
+    def use(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
+        bundle = self._bundles.get(variant)
+        previous = self._active if self._active in self._bundles else None
+
+        if bundle is None:
+            if previous is not None:
+                self._move_to_cpu(self._bundles[previous])
+                torch.cuda.empty_cache()
+            runner, config = self._builder(variant)
+            bundle = {"runner": runner, "config": config, "device": "cuda"}
+            self._bundles[variant] = bundle
+        else:
+            if previous is not None and previous != variant:
+                self._move_to_cpu(self._bundles[previous])
+                torch.cuda.empty_cache()
+            if bundle["device"] != "cuda":
+                self._move_to_cuda(bundle)
+
+        self._active = variant
+        return bundle["runner"], bundle["config"]
+
+    def _move_to_cuda(self, bundle: Dict) -> None:
+        runner: VideoDiffusionInfer = bundle["runner"]
+        runner.dit.to(self._device)
+        runner.vae.to(self._device)
+        runner.device = "cuda"
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+        bundle["device"] = "cuda"
+
+    @staticmethod
+    def _move_to_cpu(bundle: Dict) -> None:
+        if bundle["device"] == "cpu":
+            return
+        runner: VideoDiffusionInfer = bundle["runner"]
+        runner.dit.to("cpu")
+        runner.vae.to("cpu")
+        runner.device = "cpu"
+        bundle["device"] = "cpu"
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -161,35 +241,27 @@ class Predictor(BasePredictor):
 
         self.device = torch.device("cuda")
 
-        self._ensure_model_cache()
+        ensure_model_cache()
         self._ensure_flash_attn()
         self._ensure_apex()
 
-        dit_path = ensure_weight(WEIGHT_FILES["dit"])
-        vae_path = ensure_weight(WEIGHT_FILES["vae"])
-        pos_emb_path = ensure_weight(WEIGHT_FILES["pos_emb"])
-        neg_emb_path = ensure_weight(WEIGHT_FILES["neg_emb"])
-        self.pos_emb = torch.load(pos_emb_path, map_location=self.device, weights_only=True)
-        self.neg_emb = torch.load(neg_emb_path, map_location=self.device, weights_only=True)
-
-        config_path = Path("configs_3b") / "main.yaml"
-        self.config = load_config(str(config_path))
-        OmegaConf.set_readonly(self.config, False)
-        dit_model = self.config.dit.model
-        dit_model.norm = "rms"
-        dit_model.vid_out_norm = "rms"
-        if hasattr(dit_model, "txt_in_norm"):
-            dit_model.txt_in_norm = "layer"
-        if hasattr(dit_model, "qk_norm"):
-            dit_model.qk_norm = "rms"
+        shared = {name: ensure_weight(path) for name, path in SHARED_WEIGHT_FILES.items()}
+        self.pos_emb = torch.load(shared["pos_emb"], map_location=self.device, weights_only=True)
+        self.neg_emb = torch.load(shared["neg_emb"], map_location=self.device, weights_only=True)
 
         init_torch(cudnn_benchmark=False)
 
-        self.runner = VideoDiffusionInfer(self.config)
-        self.runner.configure_dit_model(device="cuda", checkpoint=str(dit_path))
-        self.runner.configure_vae_model()
-        if hasattr(self.runner.vae, "set_memory_limit"):
-            self.runner.vae.set_memory_limit(**self.runner.config.vae.memory_limit)
+        self.dual_load = self._should_preload_all_variants()
+        if self.dual_load:
+            self.runners: Dict[str, VideoDiffusionInfer] = {}
+            self.configs: Dict[str, OmegaConf] = {}
+            for variant in MODEL_VARIANTS:
+                runner, config = self._build_runner(variant)
+                self.runners[variant] = runner
+                self.configs[variant] = config
+        else:
+            self.lazy_runners = LazyRunnerManager(self.device, self._build_runner)
+            self.lazy_runners.use(DEFAULT_MODEL_VARIANT)
 
         if not getattr(self, "_destroy_registered", False):
             atexit.register(self._maybe_destroy_pg)
@@ -259,15 +331,15 @@ class Predictor(BasePredictor):
             ge=10,
             le=100,
         ),
+        model_variant: str = Input(
+            description="Model size to run.",
+            choices=list(MODEL_VARIANTS.keys()),
+            default=DEFAULT_MODEL_VARIANT,
+        ),
     ) -> CogPath:
-        input_path = Path(media)
-        if not input_path.exists():
-            raise ValueError(f"Input file {input_path} not found.")
-
-        media_type, _ = mimetypes.guess_type(str(input_path))
-        is_video = media_type and media_type.startswith("video")
-        is_image = media_type and media_type.startswith("image")
-        if not (is_video or is_image):
+        input_path, cleanup = self._resolve_media_path(media)
+        media_kind = self._detect_media_kind(input_path)
+        if media_kind not in {"image", "video"}:
             raise ValueError("Unsupported file type. Provide a video or image.")
 
         cfg_scale_val = float(_resolve_numeric(cfg_scale, 1.0))
@@ -276,10 +348,18 @@ class Predictor(BasePredictor):
         sp_size_val = int(_resolve_numeric(sp_size, 1))
         seed_val = int(_resolve_numeric(seed if seed is not None else torch.randint(0, 2**32, ()).item(), 666))
 
-        self.runner.config.diffusion.cfg.scale = cfg_scale_val
-        self.runner.config.diffusion.cfg.rescale = 0.0
-        self.runner.config.diffusion.timesteps.sampling.steps = sample_steps_val
-        self.runner.configure_diffusion()
+        if model_variant not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model variant '{model_variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+
+        if self.dual_load:
+            runner = self.runners[model_variant]
+            config = self.configs[model_variant]
+        else:
+            runner, config = self.lazy_runners.use(model_variant)
+        config.diffusion.cfg.scale = cfg_scale_val
+        config.diffusion.cfg.rescale = 0.0
+        config.diffusion.timesteps.sampling.steps = sample_steps_val
+        runner.configure_diffusion()
 
         set_seed(seed_val, same_across_ranks=True)
 
@@ -292,7 +372,7 @@ class Predictor(BasePredictor):
         cond_latents = []
         ori_lengths = []
 
-        if is_video:
+        if media_kind == "video":
             frames, _, _ = read_video(str(input_path), output_format="TCHW", pts_unit="sec")
             frames = frames.float() / 255.0
             if frames.size(0) > 121:
@@ -308,12 +388,12 @@ class Predictor(BasePredictor):
         cond_latents.append(cond)
         ori_lengths.append(cond.size(1))
 
-        if is_video:
+        if media_kind == "video":
             cond_latents = [cut_videos(cond, sp_size_val) for cond in cond_latents]
 
         with torch.inference_mode():
-            cond_latents = self.runner.vae_encode(cond_latents)
-            samples = self._generation_step(cond_latents, text_embeds)
+            cond_latents = runner.vae_encode(cond_latents)
+            samples = self._generation_step(runner, cond_latents, text_embeds)
 
         sample = samples[0]
         if ori_lengths[0] < sample.shape[0]:
@@ -322,7 +402,7 @@ class Predictor(BasePredictor):
         sample = rearrange(sample[:, None], "t c h w -> t h w c") if sample.ndim == 3 else rearrange(sample, "t c h w -> t h w c")
         sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).cpu().numpy()
 
-        if is_image:
+        if media_kind == "image":
             img_array = sample[0]
             target_ext = output_format.lower()
             encoded_ext = "jpeg" if target_ext == "jpg" else target_ext
@@ -340,9 +420,87 @@ class Predictor(BasePredictor):
             output_name = mux_audio_stream(input_path, temp_video, final_video)
 
         torch.cuda.empty_cache()
+        if cleanup:
+            input_path.unlink(missing_ok=True)
         return CogPath(str(output_name))
 
-    def _generation_step(self, cond_latents, text_embeds):
+    def _build_runner(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
+        spec = MODEL_VARIANTS.get(variant)
+        if spec is None:
+            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+        weight_path = ensure_weight(spec.weight)
+        config = load_config(spec.config)
+        OmegaConf.set_readonly(config, False)
+
+        dit_model = config.dit.model
+        dit_model.norm = "rms"
+        dit_model.vid_out_norm = "rms"
+        if hasattr(dit_model, "txt_in_norm"):
+            dit_model.txt_in_norm = "layer"
+        if hasattr(dit_model, "qk_norm"):
+            dit_model.qk_norm = "rms"
+
+        runner = VideoDiffusionInfer(config)
+        runner.configure_dit_model(device="cuda", checkpoint=str(weight_path))
+        runner.configure_vae_model()
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+
+        return runner, config
+
+    def _should_preload_all_variants(self) -> bool:
+        env_force_stage = os.getenv("SEEDVR_FORCE_STAGE", "").lower()
+        if env_force_stage in {"1", "true", "yes"}:
+            return False
+
+        env_force_dual = os.getenv("SEEDVR_FORCE_DUAL_LOAD", "").lower()
+        if env_force_dual in {"1", "true", "yes"}:
+            return True
+
+        try:
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+        except (RuntimeError, AttributeError):
+            return False
+
+        return total_mem >= 120 * 1024**3
+
+    @staticmethod
+    def _resolve_media_path(media: Union[str, Path]) -> Tuple[Path, bool]:
+        candidate = Path(media)
+        if candidate.exists():
+            return candidate, False
+
+        media_str = str(media)
+        parsed = urlparse(media_str)
+        if parsed.scheme in {"http", "https"}:
+            suffix = Path(parsed.path).suffix or ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin") as tmp:
+                with urlopen(media_str) as src, open(tmp.name, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            return Path(tmp.name), True
+
+        raise ValueError("Provide a local file path or an HTTP(S) URL.")
+
+    @staticmethod
+    def _detect_media_kind(path: Path) -> Optional[str]:
+        mime, _ = mimetypes.guess_type(str(path))
+        if mime:
+            if mime.startswith("image"):
+                return "image"
+            if mime.startswith("video"):
+                return "video"
+
+        # fallback: try to open as image
+        try:
+            with Image.open(str(path)) as img:
+                img.verify()
+            return "image"
+        except Exception:
+            pass
+
+        return "video"
+
+    def _generation_step(self, runner: "VideoDiffusionInfer", cond_latents, text_embeds):
         noises = [torch.randn_like(latent) for latent in cond_latents]
         aug_noises = [torch.randn_like(latent) for latent in cond_latents]
         noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
@@ -356,16 +514,16 @@ class Predictor(BasePredictor):
         def _add_noise(x, aug_noise):
             t = torch.tensor([1000.0], device=self.device) * cond_noise_scale
             shape = torch.tensor(x.shape[1:], device=self.device)[None]
-            t = self.runner.timestep_transform(t, shape)
-            return self.runner.schedule.forward(x, aug_noise, t)
+            t = runner.timestep_transform(t, shape)
+            return runner.schedule.forward(x, aug_noise, t)
 
         conditions = [
-            self.runner.get_condition(noise, task="sr", latent_blur=_add_noise(latent_blur, aug_noise))
+            runner.get_condition(noise, task="sr", latent_blur=_add_noise(latent_blur, aug_noise))
             for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
         ]
 
-        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            video_tensors = self.runner.inference(
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            video_tensors = runner.inference(
                 noises=noises,
                 conditions=conditions,
                 dit_offload=False,
@@ -378,19 +536,6 @@ class Predictor(BasePredictor):
             for video in video_tensors
         ]
         return samples
-
-    def _ensure_model_cache(self) -> None:
-        Path(MODEL_CACHE).mkdir(parents=True, exist_ok=True)
-        for model_file in MODEL_FILES:
-            url = BASE_URL + model_file
-            dest_path = Path(MODEL_CACHE) / model_file
-            if model_file.endswith(".tar"):
-                extracted_path = dest_path.parent / model_file.replace(".tar", "")
-                if extracted_path.exists():
-                    continue
-            elif dest_path.exists():
-                continue
-            download_weights(url, str(dest_path))
 
     @staticmethod
     def _maybe_destroy_pg():
